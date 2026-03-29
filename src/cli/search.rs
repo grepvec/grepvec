@@ -2,11 +2,11 @@
 //!
 //! Semantic search across absorbed and documented code items.
 //! Pass 1: keyword ILIKE search against Postgres biographies.
-//! Pass 2 (--neural): vector-similarity search via Enscribe search API.
+//! Pass 2 (--neural): vector-similarity search via VectorBackend trait
+//!   (Enscribe HTTP or local Qdrant+BGE, selected by config).
 
 use clap::Args;
 use colored::Colorize;
-use serde::{Deserialize, Serialize};
 
 #[derive(Args)]
 pub struct SearchArgs {
@@ -25,8 +25,8 @@ pub struct SearchArgs {
     #[arg(long, default_value = "false")]
     exact: bool,
 
-    /// Enable neural (semantic) search via Enscribe as a second pass.
-    /// Auto-enabled when Enscribe credentials are configured.
+    /// Enable neural (semantic) search as a second pass.
+    /// Auto-enabled when a vector backend is configured.
     #[arg(long)]
     neural: bool,
 
@@ -40,9 +40,20 @@ pub struct SearchArgs {
 }
 
 pub async fn run(args: SearchArgs) {
-    // Auto-enable neural when credentials are available (unless --no-neural)
-    let has_enscribe = !std::env::var("ENSCRIBE_API_KEY").unwrap_or_default().is_empty();
-    let use_neural = (args.neural || has_enscribe) && !args.no_neural;
+    // Build a vector backend from config (env vars populated by load_config)
+    let backend_config = crate::vector_backend::BackendConfig {
+        backend_type: match std::env::var("GREPVEC_VECTOR_BACKEND").as_deref() {
+            Ok("local") => crate::vector_backend::BackendType::Local,
+            _ => crate::vector_backend::BackendType::Enscribe,
+        },
+        enscribe_url: std::env::var("ENSCRIBE_BASE_URL").ok(),
+        enscribe_key: std::env::var("ENSCRIBE_API_KEY").ok(),
+        qdrant_url: std::env::var("GREPVEC_QDRANT_URL").ok(),
+        bge_url: std::env::var("GREPVEC_BGE_URL").ok(),
+    };
+
+    let backend = crate::vector_backend::create_backend(&backend_config);
+    let use_neural = (args.neural || backend.is_some()) && !args.no_neural;
 
     if use_neural {
         // Pass 1: keyword search
@@ -57,7 +68,14 @@ pub async fn run(args: SearchArgs) {
             "\n{}",
             "━━━ Pass 2: Neural Search ━━━".magenta().bold()
         );
-        neural_search(&args).await;
+        if let Some(ref backend) = backend {
+            neural_search(&args, backend.as_ref()).await;
+        } else {
+            eprintln!(
+                "{} No vector backend configured — skipping neural search",
+                "Warning:".yellow().bold()
+            );
+        }
     } else {
         db_search(&args, false).await;
     }
@@ -268,32 +286,10 @@ fn display_results(args: &SearchArgs, results: &[SearchResult], labeled: bool, m
 }
 
 // ---------------------------------------------------------------------------
-// Neural search via Enscribe API
+// Neural search via VectorBackend trait
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-struct EnscribeSearchRequest {
-    query: String,
-    collection_id: String,
-    limit: i64,
-    include_vectors: bool,
-    score_threshold: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct EnscribeSearchResponse {
-    results: Vec<EnscribeSearchResult>,
-    search_time_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EnscribeSearchResult {
-    document_id: String,
-    content: String,
-    score: f64,
-}
-
-/// Parse an Enscribe document_id like "grepvec::bio::ObserveGrpcService::health_check:chunk:0"
+/// Parse a document_id like "grepvec::bio::ObserveGrpcService::health_check:chunk:0"
 /// into a display-friendly qualified name like "ObserveGrpcService::health_check".
 fn parse_qualified_name(document_id: &str) -> String {
     // Expected format: grepvec::bio::<qualified_name>:chunk:<n>
@@ -310,131 +306,73 @@ fn parse_qualified_name(document_id: &str) -> String {
     }
 }
 
-/// Pass 2: neural/semantic search via Enscribe search API.
-async fn neural_search(args: &SearchArgs) {
-    let api_key = std::env::var("ENSCRIBE_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
+/// Pass 2: neural/semantic search via VectorBackend.
+async fn neural_search(args: &SearchArgs, backend: &dyn crate::vector_backend::VectorBackend) {
+    let collection = args
+        .collection_id
+        .clone()
+        .or_else(|| std::env::var("GREPVEC_COLLECTION").ok())
+        .unwrap_or_default();
+
+    if collection.is_empty() {
         eprintln!(
-            "{} ENSCRIBE_API_KEY not set — skipping neural search",
+            "{} No collection configured for neural search",
             "Warning:".yellow().bold()
         );
         return;
     }
 
-    let base_url = std::env::var("ENSCRIBE_BASE_URL")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
-
-    let collection_id = args.collection_id.clone()
-        .or_else(|| std::env::var("GREPVEC_COLLECTION").ok())
-        .unwrap_or_else(|| {
-            eprintln!(
-                "{} No collection ID — set --collection-id or configure .grepvec/scope.toml",
-                "Warning:".yellow().bold()
-            );
-            return String::new();
-        });
-    if collection_id.is_empty() {
-        return;
-    }
-
-    let url = format!("{}/v1/search", base_url);
-
-    let body = EnscribeSearchRequest {
-        query: args.query.clone(),
-        collection_id,
-        limit: args.limit,
-        include_vectors: false,
+    let config = crate::vector_backend::SearchConfig {
+        collection,
+        limit: args.limit as usize,
         score_threshold: 0.2,
     };
 
-    let client = reqwest::Client::new();
-    let resp = match client
-        .post(&url)
-        .header("X-API-Key", &api_key)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
+    let start = std::time::Instant::now();
+    match backend.search(&args.query, &config).await {
+        Ok(results) => {
+            let elapsed = start.elapsed().as_millis();
+            if results.is_empty() {
+                println!(
+                    "{} No neural results for \"{}\"",
+                    "Search:".yellow().bold(),
+                    args.query
+                );
+            } else {
+                println!(
+                    "\n{} {} results for \"{}\" [{}] ({}ms)\n",
+                    "Search:".green().bold(),
+                    results.len(),
+                    args.query,
+                    backend.name(),
+                    elapsed
+                );
+                for (i, r) in results.iter().enumerate() {
+                    let qname = parse_qualified_name(&r.document_id);
+                    println!(
+                        "{}. {} {} — score {:.4}",
+                        (i + 1).to_string().bold(),
+                        format!("[{}]", backend.name()).magenta().to_string(),
+                        qname.bold(),
+                        r.score
+                    );
+                    println!(
+                        "   {} {}",
+                        "doc_id:".dimmed(),
+                        r.document_id.dimmed()
+                    );
+
+                    // Show first 3 lines of content as preview
+                    for line in r.content.lines().take(3) {
+                        println!("   {}", line);
+                    }
+                    println!();
+                }
+            }
+        }
         Err(e) => {
-            eprintln!(
-                "{} Enscribe request failed: {}",
-                "Error:".red().bold(),
-                e
-            );
-            return;
+            eprintln!("{} Neural search failed: {}", "Error:".red().bold(), e);
         }
-    };
-
-    let status = resp.status();
-    if !status.is_success() {
-        let err_body = resp.text().await.unwrap_or_default();
-        eprintln!(
-            "{} Enscribe returned HTTP {}: {}",
-            "Error:".red().bold(),
-            status,
-            err_body
-        );
-        return;
-    }
-
-    let search_resp: EnscribeSearchResponse = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "{} Failed to parse Enscribe response: {}",
-                "Error:".red().bold(),
-                e
-            );
-            return;
-        }
-    };
-
-    if search_resp.results.is_empty() {
-        println!(
-            "{} No neural results for \"{}\"",
-            "Search:".yellow().bold(),
-            args.query
-        );
-        return;
-    }
-
-    let timing = search_resp
-        .search_time_ms
-        .map(|ms| format!(" ({}ms)", ms))
-        .unwrap_or_default();
-
-    println!(
-        "\n{} {} results for \"{}\" [neural]{}\n",
-        "Search:".green().bold(),
-        search_resp.results.len(),
-        args.query,
-        timing
-    );
-
-    for (i, result) in search_resp.results.iter().enumerate() {
-        let qname = parse_qualified_name(&result.document_id);
-
-        println!(
-            "{}. {} {} — score {:.4}",
-            (i + 1).to_string().bold(),
-            "[neural]".magenta().to_string(),
-            qname.bold(),
-            result.score
-        );
-        println!(
-            "   {} {}",
-            "doc_id:".dimmed(),
-            result.document_id.dimmed()
-        );
-
-        // Show first 3 lines of content as preview
-        let preview: Vec<&str> = result.content.lines().take(3).collect();
-        for line in preview {
-            println!("   {}", line);
-        }
-        println!();
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod enscribe_embed;
+pub mod vector_backend;
 pub mod canvas;
 pub mod agent_memory;
 pub mod memory;

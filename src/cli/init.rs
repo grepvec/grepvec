@@ -18,6 +18,10 @@ pub struct InitArgs {
     #[arg(long)]
     db_url: Option<String>,
 
+    /// Full local setup: Postgres + Qdrant + BGE via Docker (default when no --managed or --db-url)
+    #[arg(long)]
+    local: bool,
+
     /// Use managed backend (Enscribe API key required)
     #[arg(long)]
     managed: bool,
@@ -159,7 +163,15 @@ pub fn run(args: InitArgs) {
         }
     }
 
-    // Step 3: Provision database + create credentials
+    // Step 3: Provision database + vector infrastructure + create credentials
+    //
+    // Mode resolution:
+    //   --managed               -> managed mode (require --db-url, use Enscribe)
+    //   --db-url without --managed -> provided Postgres, still provision Qdrant+BGE locally
+    //   --local (or no flags)   -> full local stack: Postgres + Qdrant + BGE via Docker
+    let is_local_mode = !args.managed;
+    let _ = args.local; // --local is the explicit form of the default
+
     let cred_path = home_gv.join("credentials");
     if cred_path.exists() {
         println!(
@@ -184,21 +196,42 @@ pub fn run(args: InitArgs) {
             provision_local_postgres()
         };
 
-        let enscribe_key = args.enscribe_key.as_deref().unwrap_or("");
-        let enscribe_url = &args.enscribe_url;
+        // Build credentials based on mode
+        let cred_content = if is_local_mode {
+            // Local mode: provision Qdrant + BGE alongside Postgres
+            let qdrant_url = provision_local_qdrant();
+            let bge_url = provision_local_bge();
 
-        let cred_content = format!(
-            r#"# grepvec credentials — do not commit to version control
+            format!(
+                "# grepvec credentials — do not commit to version control\n\
+                 \n\
+                 [postgres]\n\
+                 url = \"{db_url}\"\n\
+                 \n\
+                 [vector]\n\
+                 backend = \"local\"\n\
+                 qdrant_url = \"{qdrant_url}\"\n\
+                 bge_url = \"{bge_url}\"\n"
+            )
+        } else {
+            // Managed mode: Enscribe backend
+            let enscribe_key = args.enscribe_key.as_deref().unwrap_or("");
+            let enscribe_url = &args.enscribe_url;
 
-[postgres]
-url = "{}"
-
-[enscribe]
-api_key = "{}"
-base_url = "{}"
-"#,
-            db_url, enscribe_key, enscribe_url
-        );
+            format!(
+                "# grepvec credentials — do not commit to version control\n\
+                 \n\
+                 [postgres]\n\
+                 url = \"{db_url}\"\n\
+                 \n\
+                 [vector]\n\
+                 backend = \"enscribe\"\n\
+                 \n\
+                 [enscribe]\n\
+                 api_key = \"{enscribe_key}\"\n\
+                 base_url = \"{enscribe_url}\"\n"
+            )
+        };
 
         std::fs::write(&cred_path, &cred_content).expect("Failed to write ~/.grepvec/credentials");
         #[cfg(unix)]
@@ -468,12 +501,8 @@ fn is_repo_root(dir: &Path) -> bool {
     markers.iter().any(|m| dir.join(m).exists())
 }
 
-/// Provision a local Postgres database via Docker.
-/// Returns the connection URL.
-fn provision_local_postgres() -> String {
-    println!("  {} Setting up local Postgres via Docker...", "Database:".cyan().bold());
-
-    // Check if Docker is available
+/// Check that Docker is available, exit with instructions if not.
+fn check_docker_available() {
     let docker_check = std::process::Command::new("docker")
         .arg("info")
         .stdout(std::process::Stdio::null())
@@ -488,10 +517,23 @@ fn provision_local_postgres() -> String {
                 "Error:".red().bold()
             );
             eprintln!("  Install Docker: https://docs.docker.com/get-docker/");
-            eprintln!("  Or provide a Postgres URL: grepvec init --db-url postgresql://...");
+            eprintln!(
+                "  Or use managed mode: grepvec init --managed --db-url postgresql://..."
+            );
             std::process::exit(1);
         }
     }
+}
+
+/// Provision a local Postgres database via Docker.
+/// Returns the connection URL.
+fn provision_local_postgres() -> String {
+    println!(
+        "  {} Setting up local Postgres via Docker...",
+        "Database:".cyan().bold()
+    );
+
+    check_docker_available();
 
     // Check if grepvec-db container already exists and is running
     let ps_output = std::process::Command::new("docker")
@@ -612,4 +654,286 @@ fn detect_language(dir: &Path) -> String {
     } else {
         "rust".to_string()
     }
+}
+
+/// Provision a local Qdrant vector database via Docker.
+/// Returns the REST API URL (http://localhost:6333).
+fn provision_local_qdrant() -> String {
+    println!(
+        "  {} Setting up local Qdrant via Docker...",
+        "Vector:".cyan().bold()
+    );
+
+    check_docker_available();
+
+    // Check if grepvec-qdrant container already exists
+    let ps_output = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "name=^grepvec-qdrant$",
+            "--format",
+            "{{.Status}}",
+        ])
+        .output();
+
+    if let Ok(output) = ps_output {
+        let status_str = String::from_utf8_lossy(&output.stdout);
+        let status_str = status_str.trim();
+        if !status_str.is_empty() {
+            if status_str.starts_with("Up") {
+                println!(
+                    "    {} grepvec-qdrant container already running (port 6333)",
+                    "✓".green()
+                );
+                return "http://localhost:6333".to_string();
+            } else {
+                // Container exists but stopped — start it
+                println!("    Starting existing grepvec-qdrant container...");
+                let start = std::process::Command::new("docker")
+                    .args(["start", "grepvec-qdrant"])
+                    .stdout(std::process::Stdio::null())
+                    .status();
+                if let Ok(s) = start {
+                    if s.success() {
+                        wait_for_qdrant();
+                        println!(
+                            "    {} grepvec-qdrant container started (port 6333)",
+                            "✓".green()
+                        );
+                        return "http://localhost:6333".to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // No existing container — create one
+    println!("    Pulling qdrant/qdrant:latest...");
+    let _ = std::process::Command::new("docker")
+        .args(["pull", "qdrant/qdrant:latest"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    println!("    Starting grepvec-qdrant container...");
+    let run = std::process::Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            "grepvec-qdrant",
+            "-p",
+            "6333:6333",
+            "-p",
+            "6334:6334",
+            "-v",
+            "grepvec-qdrant-data:/qdrant/storage",
+            "--restart",
+            "unless-stopped",
+            "qdrant/qdrant:latest",
+        ])
+        .output();
+
+    match run {
+        Ok(output) if output.status.success() => {
+            wait_for_qdrant();
+            println!(
+                "    {} grepvec-qdrant container running (port 6333)",
+                "✓".green()
+            );
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("is already in use") {
+                println!(
+                    "    {} port 6333 already in use — using existing Qdrant",
+                    "✓".green()
+                );
+            } else {
+                eprintln!(
+                    "  {} Failed to start Qdrant container: {}",
+                    "Error:".red().bold(),
+                    stderr.trim()
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} Docker run failed for Qdrant: {}",
+                "Error:".red().bold(),
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+
+    "http://localhost:6333".to_string()
+}
+
+/// Wait for Qdrant to accept connections (up to 30 seconds).
+fn wait_for_qdrant() {
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let check = std::process::Command::new("curl")
+            .args(["-sf", "http://localhost:6333/healthz"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Ok(s) = check {
+            if s.success() {
+                return;
+            }
+        }
+    }
+    eprintln!(
+        "  {} Qdrant did not become ready within 30 seconds",
+        "Warning:".yellow().bold()
+    );
+}
+
+/// Provision a local BGE embedding model via Docker (HuggingFace text-embeddings-inference).
+/// Returns the API URL (http://localhost:8080).
+fn provision_local_bge() -> String {
+    println!(
+        "  {} Setting up local BGE via Docker...",
+        "Embeddings:".cyan().bold()
+    );
+
+    check_docker_available();
+
+    // Check if grepvec-bge container already exists
+    let ps_output = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "name=^grepvec-bge$",
+            "--format",
+            "{{.Status}}",
+        ])
+        .output();
+
+    if let Ok(output) = ps_output {
+        let status_str = String::from_utf8_lossy(&output.stdout);
+        let status_str = status_str.trim();
+        if !status_str.is_empty() {
+            if status_str.starts_with("Up") {
+                println!(
+                    "    {} grepvec-bge container already running (port 8080)",
+                    "✓".green()
+                );
+                return "http://localhost:8080".to_string();
+            } else {
+                // Container exists but stopped — start it
+                println!("    Starting existing grepvec-bge container...");
+                let start = std::process::Command::new("docker")
+                    .args(["start", "grepvec-bge"])
+                    .stdout(std::process::Stdio::null())
+                    .status();
+                if let Ok(s) = start {
+                    if s.success() {
+                        wait_for_bge();
+                        println!(
+                            "    {} grepvec-bge container started (port 8080)",
+                            "✓".green()
+                        );
+                        return "http://localhost:8080".to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // No existing container — create one
+    let image = "ghcr.io/huggingface/text-embeddings-inference:cpu-1.5";
+    println!("    Pulling {}...", image);
+    let _ = std::process::Command::new("docker")
+        .args(["pull", image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    println!("    Starting grepvec-bge container...");
+    let run = std::process::Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            "grepvec-bge",
+            "-p",
+            "8080:80",
+            "-v",
+            "grepvec-bge-data:/data",
+            "--restart",
+            "unless-stopped",
+            image,
+            "--model-id",
+            "BAAI/bge-large-en-v1.5",
+        ])
+        .output();
+
+    match run {
+        Ok(output) if output.status.success() => {
+            println!(
+                "    {} grepvec-bge container running (port 8080)",
+                "✓".green()
+            );
+            println!(
+                "    {} First start downloads the BGE model (~1.3GB). This may take a few minutes.",
+                "Note:".yellow().bold()
+            );
+            wait_for_bge();
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("is already in use") {
+                println!(
+                    "    {} port 8080 already in use — using existing BGE server",
+                    "✓".green()
+                );
+            } else {
+                eprintln!(
+                    "  {} Failed to start BGE container: {}",
+                    "Error:".red().bold(),
+                    stderr.trim()
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} Docker run failed for BGE: {}",
+                "Error:".red().bold(),
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+
+    "http://localhost:8080".to_string()
+}
+
+/// Wait for BGE model server to become ready (up to 2 minutes).
+/// First start requires downloading the model (~1.3GB).
+fn wait_for_bge() {
+    for _ in 0..240 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let check = std::process::Command::new("curl")
+            .args(["-sf", "http://localhost:8080/health"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Ok(s) = check {
+            if s.success() {
+                return;
+            }
+        }
+    }
+    eprintln!(
+        "  {} BGE did not become ready within 2 minutes (model may still be downloading)",
+        "Warning:".yellow().bold()
+    );
 }

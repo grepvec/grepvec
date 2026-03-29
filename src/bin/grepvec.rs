@@ -57,6 +57,12 @@ fn load_config() {
                     if let Some(postgres) = doc.get("postgres").and_then(|v| v.as_table()) {
                         set_default("TOWER_DB_URL", postgres.get("url"));
                     }
+                    // [vector] section
+                    if let Some(vector) = doc.get("vector").and_then(|v| v.as_table()) {
+                        set_default("GREPVEC_VECTOR_BACKEND", vector.get("backend"));
+                        set_default("GREPVEC_QDRANT_URL", vector.get("qdrant_url"));
+                        set_default("GREPVEC_BGE_URL", vector.get("bge_url"));
+                    }
                 }
             }
         }
