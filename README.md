@@ -171,8 +171,8 @@ grepvec (CLI)                          grepvec-ui (visualization)
 - Structural inventory: ~5,000 items, ~9,000 edges across 4 test repositories
 - Biography generation with caller/callee/dependency relationships
 - Keyword search with tsvector ranking
-- Graph neighborhood queries (shift context)
-- Precise source code extraction (shift read)
+- Graph neighborhood queries (grepvec context)
+- Precise source code extraction (grepvec read)
 - MCP server for AI agent tool discovery
 - 3D visualization (grepvec-ui)
 - Incremental absorption (sub-second refresh when code hasn't changed)
