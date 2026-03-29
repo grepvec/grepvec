@@ -14,9 +14,13 @@ pub struct InitArgs {
     #[arg(long)]
     repos: Vec<String>,
 
-    /// Postgres connection URL
+    /// Postgres connection URL (auto-provisioned via Docker if not provided)
     #[arg(long)]
     db_url: Option<String>,
+
+    /// Use managed backend (Enscribe API key required)
+    #[arg(long)]
+    managed: bool,
 
     /// Enscribe API key (optional, enables neural search)
     #[arg(long)]
@@ -155,7 +159,7 @@ pub fn run(args: InitArgs) {
         }
     }
 
-    // Step 3: Create ~/.grepvec/credentials
+    // Step 3: Provision database + create credentials
     let cred_path = home_gv.join("credentials");
     if cred_path.exists() {
         println!(
@@ -164,7 +168,22 @@ pub fn run(args: InitArgs) {
             "~/.grepvec/credentials (not overwritten)"
         );
     } else {
-        let db_url = args.db_url.as_deref().unwrap_or("");
+        let db_url = if let Some(ref url) = args.db_url {
+            // Explicit DB URL provided
+            println!("  {} Using provided database URL", "Database:".cyan().bold());
+            url.clone()
+        } else if args.managed {
+            // Managed mode — require explicit URL or Enscribe setup (future)
+            eprintln!(
+                "  {} --managed requires --db-url (managed provisioning coming soon)",
+                "Error:".red().bold()
+            );
+            std::process::exit(1);
+        } else {
+            // Default: local Postgres via Docker
+            provision_local_postgres()
+        };
+
         let enscribe_key = args.enscribe_key.as_deref().unwrap_or("");
         let enscribe_url = &args.enscribe_url;
 
@@ -447,6 +466,139 @@ fn check_children(
 fn is_repo_root(dir: &Path) -> bool {
     let markers = ["Cargo.toml", "package.json", "pyproject.toml", "requirements.txt"];
     markers.iter().any(|m| dir.join(m).exists())
+}
+
+/// Provision a local Postgres database via Docker.
+/// Returns the connection URL.
+fn provision_local_postgres() -> String {
+    println!("  {} Setting up local Postgres via Docker...", "Database:".cyan().bold());
+
+    // Check if Docker is available
+    let docker_check = std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match docker_check {
+        Ok(status) if status.success() => {}
+        _ => {
+            eprintln!(
+                "  {} Docker is required for local mode but was not found.",
+                "Error:".red().bold()
+            );
+            eprintln!("  Install Docker: https://docs.docker.com/get-docker/");
+            eprintln!("  Or provide a Postgres URL: grepvec init --db-url postgresql://...");
+            std::process::exit(1);
+        }
+    }
+
+    // Check if grepvec-db container already exists and is running
+    let ps_output = std::process::Command::new("docker")
+        .args(["ps", "-a", "--filter", "name=grepvec-db", "--format", "{{.Status}}"])
+        .output();
+
+    if let Ok(output) = ps_output {
+        let status_str = String::from_utf8_lossy(&output.stdout);
+        let status_str = status_str.trim();
+        if !status_str.is_empty() {
+            if status_str.starts_with("Up") {
+                println!("    {} grepvec-db container already running", "✓".green());
+                return "postgresql://grepvec:grepvec@localhost:5432/grepvec".to_string();
+            } else {
+                // Container exists but stopped — start it
+                println!("    Starting existing grepvec-db container...");
+                let start = std::process::Command::new("docker")
+                    .args(["start", "grepvec-db"])
+                    .stdout(std::process::Stdio::null())
+                    .status();
+                if let Ok(s) = start {
+                    if s.success() {
+                        // Wait for Postgres to be ready
+                        wait_for_postgres();
+                        println!("    {} grepvec-db container started", "✓".green());
+                        return "postgresql://grepvec:grepvec@localhost:5432/grepvec".to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // No existing container — create one
+    println!("    Pulling postgres:16-alpine...");
+    let pull = std::process::Command::new("docker")
+        .args(["pull", "postgres:16-alpine"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if let Ok(s) = pull {
+        if !s.success() {
+            eprintln!("  {} Failed to pull postgres:16-alpine", "Warning:".yellow().bold());
+        }
+    }
+
+    println!("    Starting grepvec-db container...");
+    let run = std::process::Command::new("docker")
+        .args([
+            "run", "-d",
+            "--name", "grepvec-db",
+            "-p", "5432:5432",
+            "-e", "POSTGRES_DB=grepvec",
+            "-e", "POSTGRES_USER=grepvec",
+            "-e", "POSTGRES_PASSWORD=grepvec",
+            "-v", "grepvec-pgdata:/var/lib/postgresql/data",
+            "--restart", "unless-stopped",
+            "postgres:16-alpine",
+        ])
+        .output();
+
+    match run {
+        Ok(output) if output.status.success() => {
+            wait_for_postgres();
+            println!("    {} grepvec-db container running (port 5432)", "✓".green());
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("is already in use") {
+                println!("    {} port 5432 already in use — using existing Postgres", "✓".green());
+            } else {
+                eprintln!(
+                    "  {} Failed to start container: {}",
+                    "Error:".red().bold(),
+                    stderr.trim()
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("  {} Docker run failed: {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
+
+    "postgresql://grepvec:grepvec@localhost:5432/grepvec".to_string()
+}
+
+/// Wait for Postgres to accept connections (up to 15 seconds).
+fn wait_for_postgres() {
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let check = std::process::Command::new("docker")
+            .args(["exec", "grepvec-db", "pg_isready", "-U", "grepvec"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Ok(s) = check {
+            if s.success() {
+                return;
+            }
+        }
+    }
+    eprintln!(
+        "  {} Postgres did not become ready within 15 seconds",
+        "Warning:".yellow().bold()
+    );
 }
 
 /// Detect the primary language from project files.
