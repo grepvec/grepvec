@@ -18,6 +18,8 @@ pub fn compute_qualified_names(
         Language::Rust => rust_module_path(file_path),
         Language::Python => python_module_path(file_path),
         Language::TypeScript | Language::JavaScript => ts_module_path(file_path),
+        Language::Go => go_module_path(file_path),
+        Language::C => c_module_path(file_path),
     };
 
     // First pass: compute qualified names for top-level items
@@ -159,6 +161,62 @@ fn ts_module_path(file_path: &str) -> String {
     } else {
         stripped.to_string()
     }
+}
+
+/// Convert a Go file path to a module path.
+///
+/// Go uses the directory as the package. The file name is dropped,
+/// since all files in a directory belong to the same package.
+///
+/// Examples:
+/// - `internal/terraform/terraform.go` → `internal::terraform`
+/// - `cmd/server/main.go` → `cmd::server`
+/// - `main.go` → `` (root package)
+/// - `pkg/utils/helpers.go` → `pkg::utils`
+fn go_module_path(file_path: &str) -> String {
+    let path = file_path.replace('\\', "/");
+
+    // Strip the filename, keep directory path
+    let dir = if let Some(pos) = path.rfind('/') {
+        &path[..pos]
+    } else {
+        // File at root: main.go → empty
+        return String::new();
+    };
+
+    dir.replace('/', "::")
+}
+
+/// Convert a C file path to a module path.
+///
+/// C has no module system; use the directory path with the filename stem.
+///
+/// Examples:
+/// - `src/server.c` → `server`
+/// - `include/utils/hash.h` → `include::utils::hash`
+/// - `main.c` → `` (root)
+fn c_module_path(file_path: &str) -> String {
+    let path = file_path
+        .replace('\\', "/")
+        .trim_end_matches(".c")
+        .trim_end_matches(".h")
+        .to_string();
+
+    // Strip src/ prefix if present
+    let after_src = if let Some(pos) = path.rfind("/src/") {
+        &path[pos + 5..]
+    } else if path.starts_with("src/") {
+        &path[4..]
+    } else {
+        &path
+    };
+
+    // Handle root files
+    if after_src == "main" {
+        return String::new();
+    }
+
+    after_src.replace('/', "::")
 }
 
 /// Extract the type name from an impl item name.

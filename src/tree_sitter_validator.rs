@@ -18,7 +18,8 @@ pub enum Language {
     TypeScript,
     JavaScript,
     Python,
-    // Future: Go, Java, C, Cpp, etc.
+    Go,
+    C,
 }
 
 impl Language {
@@ -29,6 +30,8 @@ impl Language {
             "ts" | "tsx" => Some(Language::TypeScript),
             "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
             "py" | "pyi" => Some(Language::Python),
+            "go" => Some(Language::Go),
+            "c" | "h" => Some(Language::C),
             _ => None,
         }
     }
@@ -40,6 +43,8 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::JavaScript => "javascript",
             Language::Python => "python",
+            Language::Go => "go",
+            Language::C => "c",
         }
     }
 
@@ -50,6 +55,8 @@ impl Language {
             Language::TypeScript => &["ts", "tsx"],
             Language::JavaScript => &["js", "jsx", "mjs", "cjs"],
             Language::Python => &["py", "pyi"],
+            Language::Go => &["go"],
+            Language::C => &["c", "h"],
         }
     }
 }
@@ -81,6 +88,8 @@ impl Default for ValidatorConfig {
                 Language::TypeScript,
                 Language::JavaScript,
                 Language::Python,
+                Language::Go,
+                Language::C,
             ],
             ignore_patterns: vec![
                 "*.min.js".to_string(),
@@ -346,6 +355,8 @@ impl TreeSitterValidator {
             Language::TypeScript => tree_sitter_typescript::language_tsx(),
             Language::JavaScript => tree_sitter_typescript::language_tsx(),
             Language::Python => tree_sitter_python::language(),
+            Language::Go => tree_sitter_go::LANGUAGE.into(),
+            Language::C => tree_sitter_c::LANGUAGE.into(),
         };
 
         parser
@@ -416,6 +427,7 @@ impl TreeSitterValidator {
                     self.detect_js_illegal_patterns(line)
                 }
                 Language::Rust => self.detect_rust_illegal_patterns(line),
+                Language::Go | Language::C => vec![], // No illegal pattern detection yet
             };
 
             for col in detections {

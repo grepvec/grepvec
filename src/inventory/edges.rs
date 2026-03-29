@@ -56,6 +56,8 @@ pub fn extract_edges(
         Language::TypeScript | Language::JavaScript => {
             walk_ts_edges(root, source_bytes, items, &mut edges)
         }
+        Language::Go => walk_go_edges(root, source_bytes, items, &mut edges),
+        Language::C => walk_c_edges(root, source_bytes, items, &mut edges),
     }
 
     // Filter out noise edges
@@ -466,6 +468,134 @@ fn walk_ts_edge_children(
         if let Some(child) = node.named_child(i) {
             walk_ts_edges(child, source, items, edges);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Go edge detection
+// ---------------------------------------------------------------------------
+
+fn walk_go_edges(
+    node: Node,
+    source: &[u8],
+    items: &[ExtractedItem],
+    edges: &mut Vec<ExtractedEdge>,
+) {
+    match node.kind() {
+        "call_expression" => {
+            if let Some(func) = node.child_by_field_name("function") {
+                let callee = extract_go_callee(func, source);
+                if let Some(callee) = callee {
+                    let line = node.start_position().row + 1;
+                    let caller = find_enclosing_item(items, line);
+                    edges.push(ExtractedEdge {
+                        source_item_name: caller.unwrap_or_default(),
+                        edge_type: EdgeType::Calls,
+                        target_name: callee,
+                        line,
+                    });
+                }
+            }
+            walk_go_edge_children(node, source, items, edges);
+        }
+
+        _ => {
+            walk_go_edge_children(node, source, items, edges);
+        }
+    }
+}
+
+fn walk_go_edge_children(
+    node: Node,
+    source: &[u8],
+    items: &[ExtractedItem],
+    edges: &mut Vec<ExtractedEdge>,
+) {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            walk_go_edges(child, source, items, edges);
+        }
+    }
+}
+
+/// Extract callee name from a Go call expression's function node.
+fn extract_go_callee(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        // Direct call: foo()
+        "identifier" => node.utf8_text(source).ok().map(|s| s.to_string()),
+
+        // Method call or package.Function: obj.Method() or pkg.Func()
+        "selector_expression" => {
+            let field = node.child_by_field_name("field")?;
+            field.utf8_text(source).ok().map(|s| s.to_string())
+        }
+
+        // Other (type conversions, etc.)
+        _ => node.utf8_text(source).ok().map(|s| s.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C edge detection
+// ---------------------------------------------------------------------------
+
+fn walk_c_edges(
+    node: Node,
+    source: &[u8],
+    items: &[ExtractedItem],
+    edges: &mut Vec<ExtractedEdge>,
+) {
+    match node.kind() {
+        "call_expression" => {
+            if let Some(func) = node.child_by_field_name("function") {
+                let callee = extract_c_callee(func, source);
+                if let Some(callee) = callee {
+                    let line = node.start_position().row + 1;
+                    let caller = find_enclosing_item(items, line);
+                    edges.push(ExtractedEdge {
+                        source_item_name: caller.unwrap_or_default(),
+                        edge_type: EdgeType::Calls,
+                        target_name: callee,
+                        line,
+                    });
+                }
+            }
+            walk_c_edge_children(node, source, items, edges);
+        }
+
+        _ => {
+            walk_c_edge_children(node, source, items, edges);
+        }
+    }
+}
+
+fn walk_c_edge_children(
+    node: Node,
+    source: &[u8],
+    items: &[ExtractedItem],
+    edges: &mut Vec<ExtractedEdge>,
+) {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            walk_c_edges(child, source, items, edges);
+        }
+    }
+}
+
+/// Extract callee name from a C call expression's function node.
+fn extract_c_callee(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        // Direct call: foo()
+        "identifier" => node.utf8_text(source).ok().map(|s| s.to_string()),
+
+        // Field access: obj->method() or obj.method()
+        "field_expression" => {
+            let field = node.child_by_field_name("field")?;
+            field.utf8_text(source).ok().map(|s| s.to_string())
+        }
+
+        // Other (function pointer calls, etc.)
+        _ => node.utf8_text(source).ok().map(|s| s.to_string()),
     }
 }
 

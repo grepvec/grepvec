@@ -20,6 +20,8 @@ pub fn extract_items(source: &str, language: Language, tree: &Tree) -> Vec<Extra
         Language::TypeScript | Language::JavaScript => {
             walk_typescript(root, source_bytes, &source_lines, &mut items, None)
         }
+        Language::Go => walk_go(root, source_bytes, &source_lines, &mut items, None),
+        Language::C => walk_c(root, source_bytes, &source_lines, &mut items, None),
     }
 
     items
@@ -648,6 +650,625 @@ fn walk_ts_children(
         if let Some(child) = node.named_child(i) {
             walk_typescript(child, source, source_lines, items, parent);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Go item extraction
+// ---------------------------------------------------------------------------
+
+fn walk_go(
+    node: Node,
+    source: &[u8],
+    source_lines: &[&str],
+    items: &mut Vec<ExtractedItem>,
+    parent: Option<usize>,
+) {
+    match node.kind() {
+        "function_declaration" => {
+            let name = field_text(node, "name", source).unwrap_or_default();
+            let vis = go_visibility(&name);
+            let sig = extract_go_fn_signature(node, source);
+            let doc = extract_go_doc_comment(source_lines, node.start_position().row);
+
+            let idx = items.len();
+            items.push(ExtractedItem {
+                name,
+                item_type: ItemType::Function,
+                visibility: vis,
+                signature: Some(sig),
+                doc_comment: doc,
+                line_start: node.start_position().row + 1,
+                line_end: node.end_position().row + 1,
+                is_test: false,
+                is_async: false,
+                attributes: vec![],
+                child_indices: vec![],
+                qualified_name: None,
+            });
+            if let Some(p) = parent {
+                items[p].child_indices.push(idx);
+            }
+        }
+
+        "method_declaration" => {
+            let name = field_text(node, "name", source).unwrap_or_default();
+            let vis = go_visibility(&name);
+            let sig = extract_go_fn_signature(node, source);
+            let doc = extract_go_doc_comment(source_lines, node.start_position().row);
+
+            // Extract receiver type for context
+            let receiver = node
+                .child_by_field_name("receiver")
+                .and_then(|r| r.named_child(0)) // parameter_declaration inside parameter_list
+                .and_then(|pd| pd.child_by_field_name("type"))
+                .and_then(|t| t.utf8_text(source).ok())
+                .map(|s| s.trim_start_matches('*').to_string());
+
+            let is_test = name.starts_with("Test")
+                || name.starts_with("Benchmark")
+                || name.starts_with("Example");
+
+            let idx = items.len();
+            items.push(ExtractedItem {
+                name,
+                item_type: ItemType::Function,
+                visibility: vis,
+                signature: Some(sig),
+                doc_comment: doc,
+                line_start: node.start_position().row + 1,
+                line_end: node.end_position().row + 1,
+                is_test,
+                is_async: false,
+                attributes: receiver.into_iter().collect(),
+                child_indices: vec![],
+                qualified_name: None,
+            });
+            if let Some(p) = parent {
+                items[p].child_indices.push(idx);
+            }
+        }
+
+        "type_declaration" => {
+            // type_declaration contains type_spec children
+            walk_go_children(node, source, source_lines, items, parent);
+        }
+
+        "type_spec" => {
+            let name = field_text(node, "name", source).unwrap_or_default();
+            let vis = go_visibility(&name);
+            let doc = extract_go_doc_comment(source_lines, node.start_position().row);
+
+            // Determine item type from the type field
+            let type_node = node.child_by_field_name("type");
+            let item_type = match type_node.map(|n| n.kind()) {
+                Some("struct_type") => ItemType::Struct,
+                Some("interface_type") => ItemType::Trait, // Go interfaces map to Trait
+                _ => ItemType::TypeAlias,
+            };
+
+            let idx = items.len();
+            items.push(ExtractedItem {
+                name,
+                item_type,
+                visibility: vis,
+                signature: None,
+                doc_comment: doc,
+                line_start: node.start_position().row + 1,
+                line_end: node.end_position().row + 1,
+                is_test: false,
+                is_async: false,
+                attributes: vec![],
+                child_indices: vec![],
+                qualified_name: None,
+            });
+            if let Some(p) = parent {
+                items[p].child_indices.push(idx);
+            }
+        }
+
+        "const_declaration" => {
+            // Walk const_spec children
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if child.kind() == "const_spec" {
+                        let name = field_text(child, "name", source).unwrap_or_default();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let vis = go_visibility(&name);
+                        let doc = extract_go_doc_comment(source_lines, node.start_position().row);
+
+                        let idx = items.len();
+                        items.push(ExtractedItem {
+                            name,
+                            item_type: ItemType::Constant,
+                            visibility: vis,
+                            signature: None,
+                            doc_comment: doc,
+                            line_start: child.start_position().row + 1,
+                            line_end: child.end_position().row + 1,
+                            is_test: false,
+                            is_async: false,
+                            attributes: vec![],
+                            child_indices: vec![],
+                            qualified_name: None,
+                        });
+                        if let Some(p) = parent {
+                            items[p].child_indices.push(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        "var_declaration" => {
+            // Walk var_spec children
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if child.kind() == "var_spec" {
+                        let name = field_text(child, "name", source).unwrap_or_default();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let vis = go_visibility(&name);
+
+                        let idx = items.len();
+                        items.push(ExtractedItem {
+                            name,
+                            item_type: ItemType::Static, // package-level vars are like statics
+                            visibility: vis,
+                            signature: None,
+                            doc_comment: None,
+                            line_start: child.start_position().row + 1,
+                            line_end: child.end_position().row + 1,
+                            is_test: false,
+                            is_async: false,
+                            attributes: vec![],
+                            child_indices: vec![],
+                            qualified_name: None,
+                        });
+                        if let Some(p) = parent {
+                            items[p].child_indices.push(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        "import_declaration" => {
+            let text = node_text(node, source).unwrap_or_default();
+            items.push(ExtractedItem {
+                name: text,
+                item_type: ItemType::UseDeclaration,
+                visibility: Visibility::Public,
+                signature: None,
+                doc_comment: None,
+                line_start: node.start_position().row + 1,
+                line_end: node.end_position().row + 1,
+                is_test: false,
+                is_async: false,
+                attributes: vec![],
+                child_indices: vec![],
+                qualified_name: None,
+            });
+        }
+
+        _ => {
+            walk_go_children(node, source, source_lines, items, parent);
+        }
+    }
+}
+
+fn walk_go_children(
+    node: Node,
+    source: &[u8],
+    source_lines: &[&str],
+    items: &mut Vec<ExtractedItem>,
+    parent: Option<usize>,
+) {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            walk_go(child, source, source_lines, items, parent);
+        }
+    }
+}
+
+/// Go visibility: uppercase first letter = public, lowercase = private.
+fn go_visibility(name: &str) -> Visibility {
+    if name.starts_with(|c: char| c.is_uppercase()) {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
+}
+
+/// Extract Go function signature (everything before the body block).
+fn extract_go_fn_signature(node: Node, source: &[u8]) -> String {
+    if let Some(body) = node.child_by_field_name("body") {
+        let sig_start = node.start_byte();
+        let sig_end = body.start_byte();
+        std::str::from_utf8(&source[sig_start..sig_end])
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        node_text(node, source).unwrap_or_default()
+    }
+}
+
+/// Extract Go doc comment (// lines immediately preceding an item).
+fn extract_go_doc_comment(source_lines: &[&str], item_row_0idx: usize) -> Option<String> {
+    let mut comments = Vec::new();
+    let mut line = item_row_0idx;
+
+    while line > 0 {
+        line -= 1;
+        let trimmed = source_lines.get(line).map(|l| l.trim()).unwrap_or("");
+        if trimmed.starts_with("//") {
+            comments.push(trimmed[2..].trim().to_string());
+        } else if trimmed.is_empty() {
+            break; // Go doc comments must be contiguous
+        } else {
+            break;
+        }
+    }
+
+    if comments.is_empty() {
+        None
+    } else {
+        comments.reverse();
+        Some(comments.join("\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C item extraction
+// ---------------------------------------------------------------------------
+
+fn walk_c(
+    node: Node,
+    source: &[u8],
+    source_lines: &[&str],
+    items: &mut Vec<ExtractedItem>,
+    parent: Option<usize>,
+) {
+    match node.kind() {
+        "function_definition" => {
+            let name = extract_c_function_name(node, source).unwrap_or_default();
+            if name.is_empty() {
+                walk_c_children(node, source, source_lines, items, parent);
+                return;
+            }
+            let vis = extract_c_visibility(node, source);
+            let sig = extract_c_fn_signature(node, source);
+            let doc = extract_c_doc_comment(source_lines, node.start_position().row);
+
+            let idx = items.len();
+            items.push(ExtractedItem {
+                name,
+                item_type: ItemType::Function,
+                visibility: vis,
+                signature: Some(sig),
+                doc_comment: doc,
+                line_start: node.start_position().row + 1,
+                line_end: node.end_position().row + 1,
+                is_test: false,
+                is_async: false,
+                attributes: vec![],
+                child_indices: vec![],
+                qualified_name: None,
+            });
+            if let Some(p) = parent {
+                items[p].child_indices.push(idx);
+            }
+        }
+
+        "declaration" => {
+            // Check if this is a forward declaration of a function
+            let has_func_declarator = find_child_of_kind(node, "function_declarator").is_some();
+            if has_func_declarator {
+                // Forward declaration — extract as function declaration
+                let name = extract_c_decl_function_name(node, source).unwrap_or_default();
+                if !name.is_empty() {
+                    let vis = extract_c_visibility(node, source);
+                    let sig = node_text(node, source).unwrap_or_default();
+
+                    let idx = items.len();
+                    items.push(ExtractedItem {
+                        name,
+                        item_type: ItemType::Function,
+                        visibility: vis,
+                        signature: Some(sig.trim_end_matches(';').trim().to_string()),
+                        doc_comment: extract_c_doc_comment(
+                            source_lines,
+                            node.start_position().row,
+                        ),
+                        line_start: node.start_position().row + 1,
+                        line_end: node.end_position().row + 1,
+                        is_test: false,
+                        is_async: false,
+                        attributes: vec![],
+                        child_indices: vec![],
+                        qualified_name: None,
+                    });
+                    if let Some(p) = parent {
+                        items[p].child_indices.push(idx);
+                    }
+                }
+            }
+            // Otherwise skip regular variable declarations at file scope
+        }
+
+        "type_definition" => {
+            // typedef struct { ... } Name;
+            // Extract the typedef name from the declarator
+            let name = field_text(node, "declarator", source).unwrap_or_default();
+            let type_node = node.child_by_field_name("type");
+            let item_type = match type_node.map(|n| n.kind()) {
+                Some("struct_specifier") => ItemType::Struct,
+                Some("enum_specifier") => ItemType::Enum,
+                _ => ItemType::TypeAlias,
+            };
+
+            if !name.is_empty() {
+                let doc = extract_c_doc_comment(source_lines, node.start_position().row);
+                let idx = items.len();
+                items.push(ExtractedItem {
+                    name,
+                    item_type,
+                    visibility: Visibility::Public,
+                    signature: None,
+                    doc_comment: doc,
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    is_test: false,
+                    is_async: false,
+                    attributes: vec![],
+                    child_indices: vec![],
+                    qualified_name: None,
+                });
+                if let Some(p) = parent {
+                    items[p].child_indices.push(idx);
+                }
+            }
+        }
+
+        "struct_specifier" => {
+            // Named struct: struct Foo { ... }; (not inside a typedef)
+            let name = field_text(node, "name", source).unwrap_or_default();
+            if !name.is_empty() && node.child_by_field_name("body").is_some() {
+                let doc = extract_c_doc_comment(source_lines, node.start_position().row);
+                let idx = items.len();
+                items.push(ExtractedItem {
+                    name,
+                    item_type: ItemType::Struct,
+                    visibility: Visibility::Public,
+                    signature: None,
+                    doc_comment: doc,
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    is_test: false,
+                    is_async: false,
+                    attributes: vec![],
+                    child_indices: vec![],
+                    qualified_name: None,
+                });
+                if let Some(p) = parent {
+                    items[p].child_indices.push(idx);
+                }
+            }
+        }
+
+        "enum_specifier" => {
+            let name = field_text(node, "name", source).unwrap_or_default();
+            if !name.is_empty() {
+                let doc = extract_c_doc_comment(source_lines, node.start_position().row);
+                let idx = items.len();
+                items.push(ExtractedItem {
+                    name,
+                    item_type: ItemType::Enum,
+                    visibility: Visibility::Public,
+                    signature: None,
+                    doc_comment: doc,
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    is_test: false,
+                    is_async: false,
+                    attributes: vec![],
+                    child_indices: vec![],
+                    qualified_name: None,
+                });
+                if let Some(p) = parent {
+                    items[p].child_indices.push(idx);
+                }
+            }
+        }
+
+        "preproc_include" => {
+            let text = node_text(node, source).unwrap_or_default();
+            items.push(ExtractedItem {
+                name: text,
+                item_type: ItemType::UseDeclaration,
+                visibility: Visibility::Public,
+                signature: None,
+                doc_comment: None,
+                line_start: node.start_position().row + 1,
+                line_end: node.end_position().row + 1,
+                is_test: false,
+                is_async: false,
+                attributes: vec![],
+                child_indices: vec![],
+                qualified_name: None,
+            });
+        }
+
+        "preproc_def" => {
+            let name = field_text(node, "name", source).unwrap_or_default();
+            if !name.is_empty() {
+                items.push(ExtractedItem {
+                    name,
+                    item_type: ItemType::Constant,
+                    visibility: Visibility::Public,
+                    signature: None,
+                    doc_comment: None,
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    is_test: false,
+                    is_async: false,
+                    attributes: vec![],
+                    child_indices: vec![],
+                    qualified_name: None,
+                });
+            }
+        }
+
+        "preproc_function_def" => {
+            let name = field_text(node, "name", source).unwrap_or_default();
+            if !name.is_empty() {
+                let sig = node_text(node, source).unwrap_or_default();
+                items.push(ExtractedItem {
+                    name,
+                    item_type: ItemType::MacroDefinition,
+                    visibility: Visibility::Public,
+                    signature: Some(sig),
+                    doc_comment: None,
+                    line_start: node.start_position().row + 1,
+                    line_end: node.end_position().row + 1,
+                    is_test: false,
+                    is_async: false,
+                    attributes: vec![],
+                    child_indices: vec![],
+                    qualified_name: None,
+                });
+            }
+        }
+
+        _ => {
+            walk_c_children(node, source, source_lines, items, parent);
+        }
+    }
+}
+
+fn walk_c_children(
+    node: Node,
+    source: &[u8],
+    source_lines: &[&str],
+    items: &mut Vec<ExtractedItem>,
+    parent: Option<usize>,
+) {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            walk_c(child, source, source_lines, items, parent);
+        }
+    }
+}
+
+/// Extract function name from a C function_definition node.
+/// The name is inside: function_definition > declarator (function_declarator) > declarator (identifier).
+fn extract_c_function_name(node: Node, source: &[u8]) -> Option<String> {
+    let declarator = node.child_by_field_name("declarator")?;
+    extract_c_name_from_declarator(declarator, source)
+}
+
+/// Extract function name from a C declaration node (forward declaration).
+fn extract_c_decl_function_name(node: Node, source: &[u8]) -> Option<String> {
+    let declarator = node.child_by_field_name("declarator")?;
+    // For init_declarator, get the inner declarator
+    let actual = if declarator.kind() == "init_declarator" {
+        declarator.child_by_field_name("declarator")?
+    } else {
+        declarator
+    };
+    extract_c_name_from_declarator(actual, source)
+}
+
+/// Recursively descend through declarator nodes to find the identifier name.
+fn extract_c_name_from_declarator(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(source).ok().map(|s| s.to_string()),
+        "function_declarator" | "pointer_declarator" | "parenthesized_declarator" => {
+            let inner = node.child_by_field_name("declarator")?;
+            extract_c_name_from_declarator(inner, source)
+        }
+        _ => node.child_by_field_name("declarator")
+            .and_then(|d| extract_c_name_from_declarator(d, source)),
+    }
+}
+
+/// Find a named child of a specific kind (recursive, shallow).
+fn find_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if child.kind() == kind {
+                return Some(child);
+            }
+            // Check one level deeper for nested declarators
+            if let Some(found) = find_child_of_kind(child, kind) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// C visibility: static = private, everything else = public.
+fn extract_c_visibility(node: Node, source: &[u8]) -> Visibility {
+    let text = node_text(node, source).unwrap_or_default();
+    if text.starts_with("static ") || text.contains(" static ") {
+        Visibility::Private
+    } else {
+        Visibility::Public
+    }
+}
+
+/// Extract C function signature (everything before the body).
+fn extract_c_fn_signature(node: Node, source: &[u8]) -> String {
+    if let Some(body) = node.child_by_field_name("body") {
+        let sig_start = node.start_byte();
+        let sig_end = body.start_byte();
+        std::str::from_utf8(&source[sig_start..sig_end])
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        node_text(node, source).unwrap_or_default()
+    }
+}
+
+/// Extract C doc comment (// or /* */ lines preceding an item).
+fn extract_c_doc_comment(source_lines: &[&str], item_row_0idx: usize) -> Option<String> {
+    let mut comments = Vec::new();
+    let mut line = item_row_0idx;
+
+    while line > 0 {
+        line -= 1;
+        let trimmed = source_lines.get(line).map(|l| l.trim()).unwrap_or("");
+        if trimmed.starts_with("//") {
+            comments.push(trimmed[2..].trim().to_string());
+        } else if trimmed.starts_with("/*") || trimmed.starts_with("*") || trimmed.starts_with("*/")
+        {
+            // Block comment line
+            let cleaned = trimmed
+                .trim_start_matches("/*")
+                .trim_start_matches("*/")
+                .trim_start_matches('*')
+                .trim();
+            if !cleaned.is_empty() {
+                comments.push(cleaned.to_string());
+            }
+        } else if trimmed.is_empty() {
+            break;
+        } else {
+            break;
+        }
+    }
+
+    if comments.is_empty() {
+        None
+    } else {
+        comments.reverse();
+        Some(comments.join("\n"))
     }
 }
 

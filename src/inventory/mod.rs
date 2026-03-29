@@ -339,6 +339,8 @@ fn create_parser(language: Language) -> Result<tree_sitter::Parser, String> {
         Language::Rust => tree_sitter_rust::language(),
         Language::TypeScript | Language::JavaScript => tree_sitter_typescript::language_tsx(),
         Language::Python => tree_sitter_python::language(),
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::C => tree_sitter_c::LANGUAGE.into(),
     };
     parser
         .set_language(&ts_lang)
