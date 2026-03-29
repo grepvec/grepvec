@@ -1,0 +1,44 @@
+[package]
+name = "grepvec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies
+hex = "0.4"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
+urlencoding = "2.1"
+
+# Tree-Sitter Validation dependencies
+chrono = { version = "0.4", features = ["serde"] }
+tree-sitter = "0.22"
+tree-sitter-rust = "0.21"
+tree-sitter-typescript = "0.21"
+tree-sitter-python = "0.21"
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+
+# Database (absorption operational layer)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "tls-rustls"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Scope configuration
+toml = "0.8"
+dirs = "5"
+
+# Canvas (circuit board visualization)
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
+winit = "0.30.12"
+
+[[bin]]
+name = "grepvec"
+path = "src/bin/grepvec.rs"
+
+[[bin]]
+name = "grepvec-ui"
+path = "src/bin/grepvec_ui.rs"
