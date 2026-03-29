@@ -61,7 +61,7 @@ Both are configured automatically by `grepvec init`.
 
 ```bash
 # Download grepvec (Linux x86_64)
-curl -L https://grepvec.io/install | sh
+curl -L https://grepvec.com/install | sh
 
 # Initialize in your project directory
 cd your-project
@@ -188,10 +188,10 @@ grepvec (CLI)                          grepvec-ui (visualization)
 
 ### What's not yet available
 
-- **Enscribe.io integration is not yet available for public use.** The Enscribe API key option in the configuration is for internal development. Public availability will be announced at [grepvec.io](https://grepvec.io).
+- **Enscribe.io integration is not yet available for public use.** The Enscribe API key option in the configuration is for internal development. Public availability will be announced at [grepvec.com](https://grepvec.com).
 - **Local BGE + Qdrant backend** is planned but not yet implemented.
 - **Pre-built binaries** are not yet available. You must build from source.
-- **The install script at grepvec.io/install** does not yet exist.
+- **The install script at grepvec.com/install** does not yet exist.
 
 ---
 
