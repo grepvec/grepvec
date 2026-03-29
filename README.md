@@ -188,7 +188,7 @@ grepvec (CLI)                          grepvec-ui (visualization)
 
 ### What's not yet available
 
-- **Enscribe.io integration is not yet available for public use.** The Enscribe API key option in the configuration is for internal development. Public availability will be announced at [enscribe.dev](https://enscribe.dev).
+- **Enscribe.io integration is not yet available for public use.** The Enscribe API key option in the configuration is for internal development. Public availability will be announced at [grepvec.io](https://grepvec.io).
 - **Local BGE + Qdrant backend** is planned but not yet implemented.
 - **Pre-built binaries** are not yet available. You must build from source.
 - **The install script at grepvec.io/install** does not yet exist.
