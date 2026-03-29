@@ -2,6 +2,13 @@
 name = "grepvec"
 version = "0.1.0"
 edition = "2021"
+description = "Code intelligence for AI agents — structural search, graph context, precise source extraction"
+license-file = "LICENSE"
+repository = "https://github.com/grepvec/grepvec"
+homepage = "https://grepvec.com"
+readme = "README.md"
+keywords = ["search", "neural", "code", "agents", "embeddings"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Core dependencies
