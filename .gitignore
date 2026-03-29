@@ -21,3 +21,4 @@ test-data/
 # Credentials (never commit)
 credentials
 reports/
+demos/
