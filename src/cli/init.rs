@@ -497,7 +497,10 @@ fn check_children(
 
 /// Check if a directory looks like a project/repo root.
 fn is_repo_root(dir: &Path) -> bool {
-    let markers = ["Cargo.toml", "package.json", "pyproject.toml", "requirements.txt"];
+    let markers = [
+        "Cargo.toml", "package.json", "pyproject.toml", "requirements.txt",
+        "go.mod", "Makefile", "CMakeLists.txt", "configure.ac",
+    ];
     markers.iter().any(|m| dir.join(m).exists())
 }
 
@@ -527,6 +530,60 @@ fn check_docker_available() {
 
 /// Provision a local Postgres database via Docker.
 /// Returns the connection URL.
+/// Derive a project name from the current directory for database namespacing.
+fn derive_project_name() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "default".to_string())
+        .to_lowercase()
+        .replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
+}
+
+/// Create a project-scoped database in the running Postgres container.
+fn create_project_database(project_name: &str) -> String {
+    let db_name = format!("grepvec_{}", project_name);
+
+    // Check if database already exists
+    let check = std::process::Command::new("docker")
+        .args(["exec", "grepvec-db", "psql", "-U", "grepvec", "-lqt"])
+        .output();
+
+    if let Ok(output) = check {
+        let list = String::from_utf8_lossy(&output.stdout);
+        if list.contains(&db_name) {
+            println!("    {} database {} already exists", "✓".green(), db_name);
+            return format!("postgresql://grepvec:grepvec@localhost:5432/{}", db_name);
+        }
+    }
+
+    // Create the database
+    let create = std::process::Command::new("docker")
+        .args(["exec", "grepvec-db", "createdb", "-U", "grepvec", &db_name])
+        .output();
+
+    match create {
+        Ok(output) if output.status.success() => {
+            println!("    {} created database {}", "✓".green(), db_name);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("already exists") {
+                println!("    {} database {} already exists", "✓".green(), db_name);
+            } else {
+                eprintln!("    {} failed to create database: {}", "Warning:".yellow().bold(), stderr.trim());
+                // Fall back to default database
+                return "postgresql://grepvec:grepvec@localhost:5432/grepvec".to_string();
+            }
+        }
+        Err(_) => {
+            return "postgresql://grepvec:grepvec@localhost:5432/grepvec".to_string();
+        }
+    }
+
+    format!("postgresql://grepvec:grepvec@localhost:5432/{}", db_name)
+}
+
 fn provision_local_postgres() -> String {
     println!(
         "  {} Setting up local Postgres via Docker...",
@@ -546,7 +603,7 @@ fn provision_local_postgres() -> String {
         if !status_str.is_empty() {
             if status_str.starts_with("Up") {
                 println!("    {} grepvec-db container already running", "✓".green());
-                return "postgresql://grepvec:grepvec@localhost:5432/grepvec".to_string();
+                return create_project_database(&derive_project_name());
             } else {
                 // Container exists but stopped — start it
                 println!("    Starting existing grepvec-db container...");
@@ -559,7 +616,7 @@ fn provision_local_postgres() -> String {
                         // Wait for Postgres to be ready
                         wait_for_postgres();
                         println!("    {} grepvec-db container started", "✓".green());
-                        return "postgresql://grepvec:grepvec@localhost:5432/grepvec".to_string();
+                        return create_project_database(&derive_project_name());
                     }
                 }
             }
@@ -619,7 +676,7 @@ fn provision_local_postgres() -> String {
         }
     }
 
-    "postgresql://grepvec:grepvec@localhost:5432/grepvec".to_string()
+    create_project_database(&derive_project_name())
 }
 
 /// Wait for Postgres to accept connections (up to 15 seconds).
@@ -647,10 +704,15 @@ fn wait_for_postgres() {
 fn detect_language(dir: &Path) -> String {
     if dir.join("Cargo.toml").exists() {
         "rust".to_string()
+    } else if dir.join("go.mod").exists() {
+        "go".to_string()
     } else if dir.join("package.json").exists() {
         "typescript".to_string()
     } else if dir.join("pyproject.toml").exists() || dir.join("requirements.txt").exists() {
         "python".to_string()
+    } else if dir.join("Makefile").exists() || dir.join("CMakeLists.txt").exists() {
+        // C/C++ projects typically have Makefile or CMakeLists.txt
+        "c".to_string()
     } else {
         "rust".to_string()
     }
