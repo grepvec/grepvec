@@ -71,7 +71,99 @@ fn all_migrations() -> Vec<Migration> {
     vec![
         Migration {
             version: 1,
-            description: "Initial schema: repos, files, items, edges, annotations, boundary_nodes, parse_runs",
+            description: "Create base tables: repositories, source_files, items, edges, annotations, boundary_nodes, parse_runs",
+            sql: r#"
+                CREATE TABLE IF NOT EXISTS repositories (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name TEXT NOT NULL UNIQUE,
+                    path TEXT NOT NULL,
+                    primary_language TEXT NOT NULL DEFAULT 'rust',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS parse_runs (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    repo_id UUID NOT NULL REFERENCES repositories(id),
+                    git_sha TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    started_at TIMESTAMPTZ DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ,
+                    files_parsed INTEGER DEFAULT 0,
+                    items_found INTEGER DEFAULT 0,
+                    edges_found INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS source_files (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    repo_id UUID NOT NULL REFERENCES repositories(id),
+                    file_path TEXT NOT NULL,
+                    language TEXT NOT NULL DEFAULT 'rust',
+                    git_sha TEXT,
+                    line_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS items (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    file_id UUID NOT NULL REFERENCES source_files(id),
+                    parent_item_id UUID REFERENCES items(id),
+                    item_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    qualified_name TEXT,
+                    visibility TEXT NOT NULL DEFAULT 'public',
+                    signature TEXT,
+                    doc_comment TEXT,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    git_sha TEXT,
+                    is_test BOOLEAN DEFAULT false,
+                    is_async BOOLEAN DEFAULT false,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS edges (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    source_item_id UUID REFERENCES items(id),
+                    target_item_id UUID REFERENCES items(id),
+                    edge_type TEXT NOT NULL,
+                    target_name TEXT,
+                    confidence FLOAT DEFAULT 1.0,
+                    boundary_node_id UUID,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS annotations (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    item_id UUID NOT NULL REFERENCES items(id),
+                    annotation_type TEXT NOT NULL DEFAULT 'biography',
+                    content TEXT NOT NULL,
+                    author TEXT DEFAULT 'grepvec-absorb',
+                    git_sha TEXT,
+                    is_stale BOOLEAN DEFAULT false,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS boundary_nodes (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name TEXT NOT NULL,
+                    crate_name TEXT,
+                    category TEXT,
+                    apis_used TEXT,
+                    configuration TEXT,
+                    failure_impact TEXT,
+                    confidence FLOAT DEFAULT 0.5,
+                    agent_id TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            "#,
+        },
+        Migration {
+            version: 2,
+            description: "Indexes and constraints on base tables",
             sql: r#"
                 -- items: unique on (file_id, name, item_type, line_start) for upsert
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_items_file_name_type_line
@@ -100,7 +192,7 @@ fn all_migrations() -> Vec<Migration> {
             "#,
         },
         Migration {
-            version: 2,
+            version: 3,
             description: "Add tsvector search column to annotations",
             sql: r#"
                 -- annotations: add tsvector column for full-text search ranking
